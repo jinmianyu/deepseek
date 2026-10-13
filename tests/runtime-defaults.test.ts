@@ -1,0 +1,424 @@
+/**
+ * 运行时默认值测试：store 内存语义、风格后缀拼接、POST 协议校验、
+ * 回环路由 handler（真实 node:http + fetch，对齐 media-route.test.ts 模式）
+ * 与注册安全边界（非 127.0.0.1 不注册）。
+ *
+ * @module dsh-image-video/tests/runtime-defaults
+ */
+
+import { createServer, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import {
+  applyImageStyle,
+  createDefaultsRouteHandler,
+  createRuntimeDefaultsStore,
+  DEFAULTS_ROUTE_PATH,
+  extractPersistedDefaults,
+  IMAGE_SIZE_OPTIONS,
+  IMAGE_STYLE_OPTIONS,
+  MODEL_FAMILY_RULES,
+  MULTI_FRAME_CAPABLE_MODELS,
+  parseDefaultsPatch,
+  registerDefaultsRoute,
+  resolveModelCandidates,
+} from '../src/runtime-defaults.ts'
+import type { Config, Provider } from '../src/config.ts'
+import type { MediaWebServer } from '../src/media-route.ts'
+
+describe('运行时默认值存储', () => {
+  it('初始快照为空，get 返回副本', () => {
+    const store = createRuntimeDefaultsStore()
+    expect(store.get()).toEqual({})
+    const snapshot = store.get()
+    ;(snapshot as Record<string, unknown>).imageProvider = 'tampered'
+    expect(store.get()).toEqual({})
+  })
+
+  it('patch 合并写入，null 清除对应字段，其余字段保留', () => {
+    const store = createRuntimeDefaultsStore()
+    store.patch({ imageProvider: 'wanx', videoDuration: 6 })
+    expect(store.get()).toEqual({ imageProvider: 'wanx', videoDuration: 6 })
+    store.patch({ imageProvider: null })
+    expect(store.get()).toEqual({ videoDuration: 6 })
+  })
+
+  it('reset 清空全部覆盖', () => {
+    const store = createRuntimeDefaultsStore()
+    store.patch({ imageSize: '1280*720', imageStyle: 'anime' })
+    store.reset()
+    expect(store.get()).toEqual({})
+  })
+})
+
+describe('图片风格提示词后缀', () => {
+  it('未设置 / 自动 / 未知风格原样返回', () => {
+    expect(applyImageStyle('a cat', undefined)).toBe('a cat')
+    expect(applyImageStyle('a cat', '')).toBe('a cat')
+    expect(applyImageStyle('a cat', 'no-such-style')).toBe('a cat')
+  })
+
+  it('已知风格拼接英文后缀', () => {
+    const result = applyImageStyle('a cat', 'anime')
+    expect(result).toBe('a cat, anime style, cel shading, vibrant colors')
+    expect(applyImageStyle('山水', 'ink')).toContain('Chinese ink painting style')
+  })
+
+  it('末尾已有逗号时不重复', () => {
+    expect(applyImageStyle('a cat,', 'photo')).toBe('a cat, photorealistic style, professional photography, high detail')
+  })
+
+  it('风格清单含自动与五个具体风格', () => {
+    expect(IMAGE_STYLE_OPTIONS.map((o) => o.id)).toEqual(['', 'photo', 'illustration', '3d', 'anime', 'ink'])
+  })
+})
+
+describe('模型家族候选构建（resolveModelCandidates）', () => {
+  /** 全 key 可用的判断器；个别用例覆盖为只认部分服务商。 */
+  const allKeys = (): boolean => true
+  /** 仅指定服务商有 key。 */
+  const keysOf = (...providers: Provider[]): ((p: Provider) => boolean) => (p) => providers.includes(p)
+
+  it('视频固定只走 threerouter，配置链与家族直连商都不参与', () => {
+    // 项目约定：视频生成强制 ThreeRouter，禁止 OpenArt 及其他直连服务商回退。
+    expect(resolveModelCandidates('video', 'minimax-h3', 'threerouter', allKeys)).toEqual(['threerouter'])
+    expect(resolveModelCandidates('video', 'wan2.7-t2v', 'threerouter', allKeys)).toEqual(['threerouter'])
+    expect(resolveModelCandidates('video', 'wan2.7-t2v', 'wanx', allKeys)).toEqual(['threerouter'])
+    expect(resolveModelCandidates('video', 'doubao-seedance-1-0-pro-250428', 'minimax', allKeys)).toEqual(['threerouter'])
+    // 图片仍保留家族候选逻辑，不受视频锁定影响。
+    expect(resolveModelCandidates('image', 'minimax-image-01', 'wanx', allKeys)).toEqual(['wanx', 'minimax', 'threerouter'])
+  })
+
+  it('wan 关键词一条规则覆盖 wan* 与 wanx*', () => {
+    expect(resolveModelCandidates('video', 'wanx2.1-t2v-turbo', 'threerouter', allKeys)).toEqual(['threerouter'])
+    expect(resolveModelCandidates('image', 'wanx2.1-t2i-turbo', 'threerouter', allKeys)).toEqual(['threerouter', 'wanx'])
+    expect(resolveModelCandidates('image', 'wan2.1-image', 'threerouter', allKeys)).toEqual(['threerouter', 'wanx'])
+  })
+
+  it('minimax 家族参与视频与图片候选（image_generation 支持 t2i + 主体一致性 i2i）', () => {
+    // 家族路由按模型名关键词（minimax/hailuo）命中；threerouter 的 minimax 图模型名含 "minimax"
+    expect(resolveModelCandidates('image', 'minimax-image-01', 'threerouter', allKeys)).toEqual(['threerouter', 'minimax'])
+    expect(resolveModelCandidates('image', 'minimax-image-01', 'wanx', allKeys)).toEqual(['wanx', 'minimax', 'threerouter'])
+    expect(resolveModelCandidates('video', 'MiniMax-Hailuo-02', 'wanx', allKeys)).toEqual(['threerouter'])
+    // minimax 官方原生模型名 "image-01" 不含家族关键词 → 仅配置链 + 兜底（如实反映，不硬编码特例）
+    expect(resolveModelCandidates('image', 'image-01', 'wanx', allKeys)).toEqual(['wanx', 'threerouter'])
+  })
+
+  it('未配置 key 的候选自动跳过', () => {
+    // 只有 threerouter 有 key：minimax 模型的家族直连商（无 key）被过滤
+    expect(resolveModelCandidates('video', 'minimax-h3', 'threerouter', keysOf('threerouter'))).toEqual(['threerouter'])
+    // 视频锁定 threerouter：即使只有 wanx 有 key，也没有可用的视频候选
+    expect(resolveModelCandidates('video', 'wan2.7-t2v', 'wanx', keysOf('wanx'))).toEqual([])
+  })
+
+  it('自定义模型无家族命中：仅配置链 + 聚合器兜底', () => {
+    expect(resolveModelCandidates('video', 'gpt-video-9', 'wanx', allKeys)).toEqual(['threerouter'])
+    expect(resolveModelCandidates('image', 'my-custom-model', 'threerouter', allKeys)).toEqual(['threerouter'])
+  })
+
+  it('未显式指定模型：仅配置链 + 聚合器兜底', () => {
+    expect(resolveModelCandidates('video', undefined, 'threerouter', allKeys)).toEqual(['threerouter'])
+    expect(resolveModelCandidates('video', undefined, 'wanx', allKeys)).toEqual(['threerouter'])
+    expect(resolveModelCandidates('video', undefined, undefined, allKeys)).toEqual(['threerouter'])
+  })
+
+  it('全部候选均无 key 时返回空数组（工具层据此响亮报错）', () => {
+    expect(resolveModelCandidates('video', undefined, 'wanx', keysOf())).toEqual([])
+  })
+
+  it('家族规则清单符合当前厂商事实（wan 一条规则 + minimax 图片视频双能力）', () => {
+    expect(MODEL_FAMILY_RULES.map((r) => r.family)).toEqual(['minimax', 'seedance', 'wan'])
+    expect(MODEL_FAMILY_RULES.find((r) => r.family === 'wan')?.keywords).toEqual(['wan'])
+    expect(MODEL_FAMILY_RULES.find((r) => r.family === 'minimax')?.kinds).toEqual(['video', 'image'])
+  })
+})
+
+describe('settings 持久默认提取（extractPersistedDefaults）', () => {
+  /** 构造测试用插件配置：除显式覆盖字段外全部取 schema 默认值。 */
+  function makeConfig(overrides: Partial<Config> = {}): Config {
+    return {
+      provider: 'threerouter',
+      threerouter: { apiKey: 'test-key' },
+      wanx: { apiKey: '' },
+      minimax: { apiKey: '' },
+      seedance: { apiKey: '' },
+      defaultImageProvider: '',
+      defaultVideoProvider: '',
+      defaultImageSize: '1024*1024',
+      defaultVideoDuration: 5,
+      timeoutMs: 60_000,
+      pollIntervalMs: 5_000,
+      pollTimeoutMs: 300_000,
+      retryTimes: 3,
+      outputsDir: './outputs',
+      ...overrides,
+    }
+  }
+
+  it('schema 默认 config：仅提取合法尺寸与时长，空服务商不提取', () => {
+    expect(extractPersistedDefaults(makeConfig())).toEqual({
+      imageSize: '1024*1024',
+      videoDuration: 5,
+    })
+  })
+
+  it('合法服务商的持久默认被提取', () => {
+    const view = extractPersistedDefaults(makeConfig({ defaultImageProvider: 'wanx', defaultVideoProvider: 'seedance' }))
+    expect(view.imageProvider).toBe('wanx')
+    expect(view.videoProvider).toBe('seedance')
+  })
+
+  it('越界遗留值整体忽略：未知服务商 / 非白名单尺寸 / 时长越界', () => {
+    const view = extractPersistedDefaults(makeConfig({
+      defaultImageProvider: 'bogus' as unknown as Config['defaultImageProvider'],
+      defaultVideoProvider: 'also-bogus' as unknown as Config['defaultVideoProvider'],
+      defaultImageSize: '999*999',
+      defaultVideoDuration: 31,
+    }))
+    expect(view.imageProvider).toBeUndefined()
+    expect(view.videoProvider).toBeUndefined()
+    expect(view.imageSize).toBeUndefined()
+    expect(view.videoDuration).toBeUndefined()
+  })
+})
+
+describe('POST 协议校验', () => {
+  it('非对象 / 数组拒绝', () => {
+    expect(parseDefaultsPatch('x').ok).toBe(false)
+    expect(parseDefaultsPatch(null).ok).toBe(false)
+    expect(parseDefaultsPatch([1]).ok).toBe(false)
+  })
+
+  it('未知字段拒绝', () => {
+    const result = parseDefaultsPatch({ nope: 1 })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toContain('nope')
+  })
+
+  it('合法写入并归一化：空串视为 null（自动）', () => {
+    const result = parseDefaultsPatch({ imageProvider: 'wanx', imageSize: '', videoDuration: null })
+    expect(result).toEqual({
+      ok: true,
+      patch: { imageProvider: 'wanx', imageSize: null, videoDuration: null },
+    })
+  })
+
+  it('imageSize 仅接受白名单尺寸', () => {
+    expect(parseDefaultsPatch({ imageSize: '1024*1024' }).ok).toBe(true)
+    const bad = parseDefaultsPatch({ imageSize: '999*999' })
+    expect(bad.ok).toBe(false)
+    if (!bad.ok) expect(bad.error).toContain('imageSize')
+  })
+
+  it('imageSize 白名单覆盖五个比例（3:4 按实测规格 1152*1536）', () => {
+    expect(IMAGE_SIZE_OPTIONS.map((o) => o.size)).toEqual(['1024*1024', '1152*864', '1152*1536', '1280*720', '720*1280'])
+  })
+
+  it('MULTI_FRAME_CAPABLE_MODELS 首项为 MiniMax-H3，且仍包含 wan3.0-video', () => {
+    expect(MULTI_FRAME_CAPABLE_MODELS[0]).toBe('MiniMax-H3')
+    expect(MULTI_FRAME_CAPABLE_MODELS).toContain('wan3.0-video')
+  })
+
+  it('imageStyle 仅接受白名单风格', () => {
+    expect(parseDefaultsPatch({ imageStyle: 'ink' }).ok).toBe(true)
+    expect(parseDefaultsPatch({ imageStyle: '' }).ok).toBe(true) // 空 = 自动（清除）
+    expect(parseDefaultsPatch({ imageStyle: 'oil' }).ok).toBe(false)
+  })
+
+  it('videoAspectRatio 仅接受 16:9 / 9:16 / 1:1', () => {
+    expect(parseDefaultsPatch({ videoAspectRatio: '16:9' }).ok).toBe(true)
+    expect(parseDefaultsPatch({ videoAspectRatio: '4:3' }).ok).toBe(false)
+  })
+
+  it('videoDuration 仅接受 1-30 整数', () => {
+    expect(parseDefaultsPatch({ videoDuration: 8 }).ok).toBe(true)
+    expect(parseDefaultsPatch({ videoDuration: 0 }).ok).toBe(false)
+    expect(parseDefaultsPatch({ videoDuration: 31 }).ok).toBe(false)
+    expect(parseDefaultsPatch({ videoDuration: 5.5 }).ok).toBe(false)
+    expect(parseDefaultsPatch({ videoDuration: '5' }).ok).toBe(false)
+  })
+
+  it('服务商字段仅接受白名单值，空串归一化为自动（清除）', () => {
+    expect(parseDefaultsPatch({ videoProvider: 'no-such' }).ok).toBe(false)
+    expect(parseDefaultsPatch({ imageProvider: 'wanx' }).ok).toBe(true)
+    expect(parseDefaultsPatch({ imageProvider: '' }).ok).toBe(true)
+  })
+})
+
+describe('defaults 路由 handler', () => {
+  let server: Server
+  let base: string
+  const store = createRuntimeDefaultsStore()
+
+  beforeAll(async () => {
+    server = createServer((req, res) => {
+      void createDefaultsRouteHandler(store)(req, res)
+    })
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  })
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve())
+      server.closeAllConnections()
+    })
+  })
+
+  it('GET 初始返回六字段全 null 视图', async () => {
+    const res = await fetch(`${base}${DEFAULTS_ROUTE_PATH}`)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({
+      imageProvider: null,
+      imageSize: null,
+      imageStyle: null,
+      videoProvider: null,
+      videoAspectRatio: null,
+      videoDuration: null,
+    })
+  })
+
+  it('POST 合法写入后 GET 读回覆盖值', async () => {
+    const post = await fetch(`${base}${DEFAULTS_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageStyle: 'anime', videoDuration: 8 }),
+    })
+    expect(post.status).toBe(200)
+    expect(await post.json()).toEqual({
+      imageProvider: null,
+      imageSize: null,
+      imageStyle: 'anime',
+      videoProvider: null,
+      videoAspectRatio: null,
+      videoDuration: 8,
+    })
+  })
+
+  it('POST null 清除覆盖', async () => {
+    await fetch(`${base}${DEFAULTS_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageStyle: null }),
+    })
+    const res = await fetch(`${base}${DEFAULTS_ROUTE_PATH}`)
+    const view = await res.json() as Record<string, unknown>
+    expect(view.imageStyle).toBeNull()
+    expect(view.videoDuration).toBe(8)
+  })
+
+  it('POST 未知字段 400 且不修改存储', async () => {
+    const res = await fetch(`${base}${DEFAULTS_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hacker: true }),
+    })
+    expect(res.status).toBe(400)
+    const view = await (await fetch(`${base}${DEFAULTS_ROUTE_PATH}`)).json() as Record<string, unknown>
+    expect(view.videoDuration).toBe(8)
+  })
+
+  it('POST 非法 JSON 400', async () => {
+    const res = await fetch(`${base}${DEFAULTS_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{not-json',
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('PUT 405', async () => {
+    const res = await fetch(`${base}${DEFAULTS_ROUTE_PATH}`, { method: 'PUT' })
+    expect(res.status).toBe(405)
+    expect(res.headers.get('allow')).toBe('GET, POST')
+  })
+})
+
+describe('defaults 路由合并视图（override ?? settings 持久默认）', () => {
+  let server: Server
+  let base: string
+  const store = createRuntimeDefaultsStore()
+  const persisted = { imageProvider: 'wanx', videoDuration: 6 }
+
+  beforeAll(async () => {
+    server = createServer((req, res) => {
+      void createDefaultsRouteHandler(store, persisted)(req, res)
+    })
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  })
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve())
+      server.closeAllConnections()
+    })
+  })
+
+  it('GET 无覆盖时回落 settings 持久默认', async () => {
+    const res = await fetch(`${base}${DEFAULTS_ROUTE_PATH}`)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({
+      imageProvider: 'wanx',
+      imageSize: null,
+      imageStyle: null,
+      videoProvider: null,
+      videoAspectRatio: null,
+      videoDuration: 6,
+    })
+  })
+
+  it('运行时覆盖优先于持久默认', async () => {
+    await fetch(`${base}${DEFAULTS_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageProvider: 'seedance' }),
+    })
+    const view = await (await fetch(`${base}${DEFAULTS_ROUTE_PATH}`)).json() as Record<string, unknown>
+    expect(view.imageProvider).toBe('seedance')
+    expect(view.videoDuration).toBe(6)
+  })
+
+  it('POST 空串清除覆盖后回落持久默认', async () => {
+    await fetch(`${base}${DEFAULTS_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageProvider: '' }),
+    })
+    const view = await (await fetch(`${base}${DEFAULTS_ROUTE_PATH}`)).json() as Record<string, unknown>
+    expect(view.imageProvider).toBe('wanx')
+  })
+})
+
+describe('defaults 路由注册安全边界', () => {
+  function fakeWebServer(host: string): MediaWebServer & { routes: Map<string, unknown> } {
+    const routes = new Map<string, unknown>()
+    return {
+      host,
+      routes,
+      register(route) {
+        routes.set(`${route.kind}:${route.path}`, route.handler)
+        return () => routes.delete(`${route.kind}:${route.path}`)
+      },
+    }
+  }
+
+  it('127.0.0.1 注册 exact 路由并返回注销函数', () => {
+    const webServer = fakeWebServer('127.0.0.1')
+    const dispose = registerDefaultsRoute(webServer, createRuntimeDefaultsStore())
+    expect(dispose).toBeTypeOf('function')
+    expect(webServer.routes.has(`exact:${DEFAULTS_ROUTE_PATH}`)).toBe(true)
+    dispose?.()
+    expect(webServer.routes.size).toBe(0)
+  })
+
+  it('0.0.0.0 不注册', () => {
+    const webServer = fakeWebServer('0.0.0.0')
+    expect(registerDefaultsRoute(webServer, createRuntimeDefaultsStore())).toBeUndefined()
+    expect(webServer.routes.size).toBe(0)
+  })
+})

@@ -1,0 +1,371 @@
+# 🎨 dsh-image-video — AI 文生图 / 文生视频插件 for DeepSeek Harness
+
+**为 DeepSeek Harness 对话模型注册 `generate_image` / `generate_video` 两个工具。模型在对话中自主决策调用，生成结果自动下载到本地 `outputs/`，图片经 attachment 服务内嵌渲染——对话即创作，无需离开终端。**
+
+> DSH 生态有丰富的工具插件，但缺少一个轻量、即装即用的文生图/文生视频入口。dsh-image-video 填补这个空白：两个工具、四家服务商、零外部依赖，热插拔即用。
+
+## 核心特性
+
+- **图片单次提交与幂等找回** — `imageTransport: auto` 优先使用异步任务；提交超时/5xx 时只按 `request_id` 反查原任务，默认不盲目重提、不换模型、不生成候选，异步端点未启用时安全降级同步单次提交
+- **统一品牌水印后处理** — 图片在写入 `outputsDir` 和附件前以内存方式叠加可配置水印，桌面交互流直接展示最终水印图，并透出传输方式、提交次数与后处理元数据
+- **两个工具，自然语言触发** — 模型在对话中自主决策何时调用 `generate_image` / `generate_video`，无需手动指令
+- **四家服务商 + 按模型家族自动路由** — Threerouter（聚合器，默认）、万象 wanx（阿里云百炼）、MiniMax 官方平台、Seedance2.5（火山引擎）；显式指定模型时按家族关键词自动选择直连商，Threerouter 永远兜底，回退链透明写入 notes
+- **异步任务不阻塞对话** — `TaskManager` 基于 `ctx.effect()` 托管轮询生命周期，插件卸载时自动取消排队任务、清理定时器，杜绝内存泄漏
+- **图片内嵌渲染** — 图片字节经 attachment 服务持久化，附件引用走 `presentationMeta` UI-only 通道，模型只见文本摘要，纯文本模型照常工作
+- **统一异常分类** — `GenerationError` 五类错误（auth / quota / task / timeout / network），可重试错误指数退避，不可重试错误即时中止
+- **声明式服务依赖** — `inject = ['tools']` 顶部声明 + `ctx.inject(['attachments'])` 显式注入，不假设其他插件内部实现
+
+## 能力概览
+
+| 工具 | 能力 | 服务商 | 异步轮询 | 对话渲染 |
+|---|---|---|---|---|
+| `generate_image` | 文生图 + **图生图**（可选 `image` 参考图入参） | **Threerouter**（默认）/ 万象 wanx / MiniMax 官方 / Seedance2.5 | 同步或异步（自动适配） | 图片经 `presentationMeta` 内嵌渲染；模型只见文本摘要 |
+| `generate_video` | 文生短视频 + 图生视频（首帧驱动，上限 30s）+ **视频编辑**（`media[].video` 参考视频 + 编辑意图提示词，保留原片动作换主体） | **Threerouter**（默认）/ 万象 wanx / MiniMax 官方 / Seedance2.5 | 始终异步轮询，不阻塞对话 | 本地文件路径 + 源地址 |
+
+## Provider 矩阵
+
+| 服务商 | 渠道 | 文生图 | 图生图 | 文生视频 | 备注 |
+|---|---|---|---|---|---|
+| **Threerouter**（默认，聚合器） | threerouter.com Bearer Key | ✅ `/images/generations` 同步（默认 `qwen-image-3.0`） | ✅ 同端点 `image` 参考图字段（默认 `qwen-image-3.0-pro`；2026-09 文档：/images/edits 已移除） | ✅ 已验证（MiniMax-H3 / wan 系） | 生图走 OpenAI Images 标准结构（url/b64_json 双形态 + 顶层 url 兼容）；视频走 `/v1/media/generations` + 轮询 |
+| **万象 wanx**（阿里云百炼） | DashScope `sk-` Key | ✅ 已验证（wanx2.1-t2i-turbo） | ✅ **已实测**（wanx2.1-imageedit，`base_image_url` 字段，参考图宽度须 512–4096px） | ✅ 已验证（wan2.2-t2v-plus） | i2i 为 description_edit 异步任务；图片同步/异步自适应；视频始终异步 |
+| **MiniMax 官方平台** | platform.minimaxi.com Key | ✅ `image-01`（待 key 实测） | ✅ `subject_reference` 主体一致性（待 key 实测） | ✅ 适配器已实现（video-generation v2，待 key 实测） | 图片同步返回 **base64**（无 URL），插件直接落盘；i2i 语义为「保留主体换场景」，每次仅 1 张参考图；Hailuo 系视频；缺省注入 `768P` |
+| **Seedance2.5**（火山引擎 Ark） | ARK API Key | ✅ 适配器已实现（即梦 3.0） | ✅ Seedream 4.0 `image` 入参（待 key 实测） | ✅ 适配器已实现 | 图片同步返回 URL（24h 有效立即下载）；i2i 默认模型自动切换 Seedream 4.0（3.0 不支持参考图）；显式关组图与水印；视频走异步任务 |
+
+## 模型家族路由
+
+显式指定 `model` 参数时，插件按厂商关键词（小写包含匹配，一条规则覆盖一个家族）构建候选服务商序列，按序尝试提交：
+
+| model 含关键词 | 家族 | 候选服务商（有序） |
+|---|---|---|
+| `minimax` / `hailuo` | MiniMax | `minimax`（官方直连）→ `threerouter`（图片+视频） |
+| `doubao` / `seedance` / `seedream` | 火山方舟 | `seedance`（直连）→ `threerouter` |
+| `wan`（覆盖 `wan*` 与 `wanx*`） | 通义万相 | `wanx`（百炼直连）→ `threerouter` |
+| 无命中（自定义模型） | 未知 | 仅配置链 + `threerouter` |
+
+候选序列 = **配置链服务商**（composer 会话选定 > 配置默认 > 激活服务商，配置优先）→ 家族直连商 → **threerouter 聚合器兜底**（其目录覆盖所有家族的模型）。回退规则：
+
+- 仅在提交阶段的「模型不被该服务商接受」类错误（模型不存在 / 能力缺失，判定见 `isModelNotAcceptedError`）时回退下一候选；
+- 403 **分组/模型未开通该能力**（threerouter 实测：`permission_error`「Image generation is not enabled for this group」，文档语义 403=无该分组/模型权限或未开通生图 `allow_image_generation`）视为「该候选无法服务此请求」，同样回退下一候选；
+- 鉴权 Key 无效（401）、无权限语义的 403、配额（429）、网络/超时错误**响亮失败不回退**，不掩盖配置错误；
+- 拿到任务 ID 之后的任何失败**不回退**，绝不重复生成、双重扣费；
+- 回退链写入结果 `notes` 透明告知。
+
+新模型（wan3.0、qwen-video、minimax 新版本等）无需逐个登记即自动命中家族规则，维护点只按厂商关键词。
+
+## 结果透明与配置自证
+
+- **每次调用自报身份（固定标准输出）**：`generate_video` / `generate_image` 的可见文本固定包含**提示词、服务商、实际发给上游的模型名**（未指定模型时显示服务商内置默认的实际值）、生成模式、时长参数、分辨率与 `notes`（时长被丢弃、候选回退链）。「这次用了哪个服务商、哪个模型、有没有降级」直接看结果即可，不必去服务商后台对账，也不必从配置推断。配合桌面客户端 keyed toolview（消费 `presentationMeta` 的 `localPath`/`prompt` 渲染内嵌播放器），构成「**提示词 + 播放器 + 结果块**」的固定标准输出：任何人安装本插件即自动获得，无需任何配置。
+- **启动即打印生效配置**：插件 `apply()` 向宿主日志写一行生效配置摘要（`provider` / `defaultVideoProvider` / `defaultImageProvider` / `defaultVideoModel` / `defaultImageModel` / `defaultVideoDuration` / `outputsDir` / 各服务商 key 是否已配置），**绝不包含 key 明文**。多 profile（web / desktop）场景可直接从日志确认哪个 patch 层生效。
+
+## 快速开始
+
+### 1. 安装
+
+```sh
+# GitHub 远程安装
+dsh plugin --profile <profile> add github:ihero3/dsh-image-video
+```
+
+> 构建产物 `lib/` 已随仓库提交，安装过程不执行任何构建脚本，无需 pnpm 的 `allowBuilds` 授权。
+
+### 2. 配置 API Key
+
+在 profile 的 `cordis.patch.yml` 中覆盖默认配置（`~/.dsh/profiles/<profile>/cordis.patch.yml`）：
+
+```yaml
+- id: image-video
+  config:
+    provider: threerouter             # threerouter（默认，聚合器） | wanx | minimax | seedance
+    threerouter:
+      apiKey: !!js process.env.THREEROUTER_API_KEY
+      baseURL: ''
+    wanx:
+      apiKey: !!js process.env.DASHSCOPE_API_KEY
+      baseURL: ''
+    minimax:
+      apiKey: !!js process.env.MINIMAX_API_KEY   # 官方平台 key，可选（无则自动跳过该候选）
+      baseURL: ''
+    seedance:
+      apiKey: ''
+      baseURL: ''
+    defaultImageSize: '1024*1024'      # 百炼接口要求 * 分隔
+    defaultVideoDuration: 5
+    timeoutMs: 60000
+    pollIntervalMs: 5000
+    pollTimeoutMs: 300000
+    retryTimes: 3
+    outputsDir: './outputs'
+    imageTransport: auto              # auto | async（强制） | sync（强制同步）
+    imageUnknownStatePolicy: fail     # fail（默认）| resubmit-same-key
+    watermark:
+      enabled: true
+      text: 'Threerouter'
+      position: bottom-right
+      opacity: 0.68
+      fontSizeRatio: 0.032
+      marginXRatio: 0.028
+      marginYRatio: 0.012
+      glowEnabled: true
+      glowColor: '#ffffff'
+      glowBlurRatio: 0.18
+```
+
+凭证建议通过环境变量注入（`!!js process.env.XXX`），不要明文写入配置文件。DSH 凭证系统支持 `~/.dsh/.credentials.yaml` 和 `~/.dsh/.env` 两种来源。
+
+### 3. 运行
+
+```sh
+# headless 模式（一次性任务）
+dsh --profile headless "帮我画一只赛博朋克风格的猫，1080*1080"
+
+# 交互式模式（持续对话）
+dsh --profile <profile>
+```
+
+模型会自主决策调用 `generate_image` 工具：
+
+```
+用户：帮我画一只赛博朋克风格的猫，1080*1080
+
+模型（调用 generate_image）：
+  prompt: "赛博朋克风格的猫"
+  size: "1080*1080"
+
+→ 图片保存到 outputs/<时间戳>-<随机>.png
+→ 附件引用经 presentationMeta 持久化，客户端可内嵌渲染
+→ 模型收到文本摘要（路径 / 服务商 / 尺寸 / 大小）
+```
+
+**文生视频：**
+
+```
+用户：生成一段 5 秒的海浪拍打沙滩视频
+
+模型（调用 generate_video）：
+  prompt: "海浪拍打沙滩"
+  duration: 5
+
+→ 后台轮询任务状态（不阻塞对话）
+→ 完成后视频保存到 outputs/<时间戳>-<随机>.mp4
+→ 对话返回文件路径
+```
+
+**图生视频（让图片动起来）：**
+
+```
+用户：参考这张图 /path/photo.png 生成一段视频
+
+模型（调用 generate_video）：
+  prompt: "让画面自然地动起来"
+  image: "/path/photo.png"
+  duration: 5
+
+→ 本地路径自动编码为 data URL（http(s)/data URL 原样透传）
+→ 存在 image 时构图由首帧决定：不传 aspectRatio，模型用服务商内置 i2v 默认模型（图生视频时该参数被忽略）
+→ 完成后视频首帧即该图片
+```
+
+`resolution` 为可选分辨率档位，取值由服务商与模型决定（如 MiniMax-H3：`480P/768P/2K`；wan 图生视频：`480P/1080P`），留空使用服务商默认（MiniMax 系要求显式携带，未指定时插件自动注入 `768P`），不支持的值由上游响亮报错。图生视频的字段映射：threerouter `image`、wanx `input.img_url`、Seedance content 数组 `image_url` 块、MiniMax 官方 `first_frame_image`（MiniMax/Seedance 分支按官方协议实现，未在真实账号验证）。
+
+**视频编辑（参考视频换主体 / 改元素）：**
+
+```
+用户：把这段视频里的人物换成图片里的人  /path/source.mp4  /path/person.png
+
+模型（调用 generate_video）：
+  prompt: "编辑视频1：把视频1里的人物替换成图片1中的人物，保持镜头运动与人物动作不变"
+  media: [
+    { video: "/path/source.mp4", type: "reference_video" },
+    { image: "/path/person.png", type: "reference_image" }
+  ]
+
+→ 存在参考视频时缺省 model=wan3.0-video、aspectRatio=adaptive、duration=-1（保持原片时长）
+→ 本地素材在客户端预处理：图片按需压到长边 1600 的 JPEG，视频压到 ≤15 秒 / 720p / CRF 32
+→ 完成后视频保存到 outputs/，并缺省额外产出一条「原片 / 复刻」对比片
+```
+
+**原片 / 复刻对比片（缺省自动生成）**：存在参考视频时，`generate_video` 缺省（`compare: true`）额外产出一条对比片，把原片与复刻结果并进同一画布直接对照，路径同时出现在结果文本与 `output.comparePath`。
+
+**拼接方向按原片画幅自动选择**：竖屏（3:4、9:16，即 `height ≥ width`）**左右并排**，横屏（4:3、16:9，即 `width > height`）**上下堆叠**——竖屏再上下堆叠会得到极端细长的画面、横屏再左右并排会得到极端宽扁的画面，两者都难以观看。判据见 `src/compare.ts` 的 `resolveCompareLayout`。
+
+对比片两侧等比缩放放进同一格（单格高度取 720 与原片高度的较小值）、统一 30fps、按较短者截断；命中常见系统字体时叠加 `ORIGINAL` / `AI RECREATED` 角标（字体全部未命中则不加，合成照常完成）。合成失败**只写进 `notes`**，不影响已经下载完成的复刻结果。
+
+**视频编辑的能力与边界**：`wan3.0-video` 是 All-in-One 视频模型，按 `input.media[].type` 与提示词意图自动路由任务类型——`reference_video` + 含编辑意图的提示词（"替换""改成""去掉"等）即「保留原片构图与动作、只改写指定元素」，**不需要额外的控制参数**（该模型没有 depth/pose 控制入参，深度等信息由服务端自原片自行提取）。上游限制：参考视频单段 ≤15 秒、最多 5 段、总时长 ≤15 秒、单文件 ≤100MB；参考图最多 10 张、单张 ≤20MB；`reference_*` 与 `first_frame`/`last_frame` 不可混用。
+
+**本地素材为何要压缩**：threerouter **没有文件上传端点**（2026-09-22 探测 `/v1/files`、`/v1/uploads`、`/v1/assets` 全 404），本地视频/图片只能以 data URL 提交，而过大的请求体会被网关拒绝（生图端点实测 2.4MB 载荷连续 502、≤1MB 稳定通过）。因此插件在客户端完成压缩，并对压缩后仍超过 6MB 的参考视频**响亮报错**（提示改用公网 URL 或裁短），而不是提交一个必然失败的巨型请求体。
+
+**图生图（参考图）语义差异**：`image` 入参各家模型行为不同——threerouter `/images/edits`（gpt-image-2 等）按提示词自由编辑；方舟 Seedream 4.0+ 按参考图编辑/组图（默认模型自动切换为 Seedream 4.0，3.0 不支持参考图）；MiniMax `subject_reference` 是**主体一致性**（保留人物/主体特征换场景换动作），且每次仅支持 1 张参考图、官方示例仅网络 URL（本地图转 data URL 传入待实测）。尺寸默认 **3:4**（`config.defaultImageSize`，接受比例写法 `3:4`/`16:9`/`1:1`）：qwen/wan 系自动换算为上游要求的 `宽*高`（长边 1536、32 对齐，如 3:4→1152*1536，实测 `3:4` 原样透传会被千问 400）；threerouter（OpenAI 系）/ 方舟系换算为 `宽x高`；MiniMax 比例写法原样透传。**实测约束**：百炼 `wanx2.1-imageedit` 参考图宽度须 512–4096px（过小先放大再调用）；其文字渲染弱（拼写易错），需要精准文字时建议生成后本地合成（如 ffmpeg drawtext）；千问图像默认开启 prompt_extend+思考模式，出图约 1–5 分钟，超时已按官方建议抬到 600s。
+
+**时长与模型能力**：wan 系模型（`wan2.2-t2v-plus`、`wan2.7-t2v`）不支持自定义时长——调用时传入 `duration` 会被插件丢弃（不发给上游，避免 `duration customization is not supported` 报错），并在结果 `notes` 中透明注明，实际时长由上游模型默认决定；MiniMax 系（`minimax-h3`）支持 4–15 秒。能力表见 `src/runtime-defaults.ts` 的 `VIDEO_DURATION_UNSUPPORTED`，按上游实测维护。
+
+## 目录结构
+
+```
+dsh-image-video/
+├── package.json              # 依赖定义 + dsh.bundle manifest + build/prepublishOnly 脚本
+├── cordis.patch.yml          # bundle 层插件清单（image-video 行 + 默认 config）
+├── lib/                      # 构建产物，随仓库提交（安装方无需构建）
+├── tsconfig.json             # TypeScript 配置
+├── tsdown.config.ts          # 构建配置（build 脚本调用）
+├── README.md
+└── src/
+    ├── index.ts              # 主入口：name / inject / Config / apply
+    ├── config.ts             # 配置 Schema（Schemastery）
+    ├── http-client.ts        # 统一 HTTP 客户端 + 异常分类 + 可配置重试
+    ├── task-manager.ts       # 异步任务管理器（ctx.effect 托管轮询生命周期）
+    ├── media.ts              # 媒体下载 / 落地 / 摘要文本 / presentationMeta
+    ├── providers/
+    │   ├── types.ts          # ProviderAdapter 接口 + 通用类型
+    │   ├── threerouter.ts    # Threerouter API 适配器（默认服务商，聚合器：图片+视频）
+    │   ├── wanx.ts           # 万象（wanx）API 适配器
+    │   ├── minimax.ts        # MiniMax 官方平台适配器（video-generation v2 + image_generation）
+    │   └── seedance.ts       # Seedance2.5 API 适配器
+    └── tools/
+        ├── generate-image.ts # generate_image 工具注册
+        └── generate-video.ts # generate_video 工具注册
+```
+
+## 配置
+
+插件配置通过 Schemastery 暴露，可在 profile 的 `cordis.patch.yml` 或 `--patch` 覆盖层中按 `id: image-video` 覆盖。完整字段：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `provider` | `'threerouter' \| 'wanx' \| 'minimax' \| 'seedance'` | `threerouter` | 激活的服务商，切换后立即生效（HMR） |
+| `threerouter.apiKey` | `string` | `''` | Threerouter API Key；`provider=threerouter` 时必填 |
+| `threerouter.baseURL` | `string` | `''` | Threerouter 自定义接口地址，留空用默认端点 |
+| `wanx.apiKey` | `string` | `''` | 万象 API Key；`provider=wanx` 时必填 |
+| `minimax.apiKey` | `string` | `''` | MiniMax 官方平台 API Key；`provider=minimax` 或模型家族路由命中时使用，留空自动跳过该候选 |
+| `wanx.baseURL` | `string` | `''` | 万象自定义接口地址，留空用默认端点 |
+| `seedance.apiKey` | `string` | `''` | Seedance2.5 API Key；`provider=seedance` 时必填 |
+| `seedance.baseURL` | `string` | `''` | Seedance2.5 自定义接口地址，留空用默认端点 |
+| `defaultImageProvider` | `'' \| 'threerouter' \| 'wanx' \| 'seedance'` | `''` | 默认图片服务商，留空跟随激活服务商，adapter 用其内置默认模型 |
+| `defaultVideoProvider` | `'' \| 'threerouter' \| 'wanx' \| 'seedance'` | `''` | 默认视频服务商，留空跟随激活服务商，adapter 用其内置默认模型 |
+| `defaultImageModel` | `string` | `''` | 默认图片模型，留空用服务商内置默认（模型取值链：调用参数 > 此配置 > 内置默认） |
+| `defaultVideoModel` | `string` | `''` | 默认视频模型，留空用服务商内置默认（threerouter 内置 `minimax-h3`） |
+| `defaultImageSize` | `string` | `'1024*1024'` | 默认图片尺寸，形如 `宽*高`（百炼接口要求 `*` 分隔） |
+| `defaultVideoDuration` | `number` | `5` | 默认视频时长（秒），范围 1-10 |
+| `timeoutMs` | `number` | `60000` | 单次 HTTP 请求超时（毫秒） |
+| `pollIntervalMs` | `number` | `5000` | 视频任务轮询间隔（毫秒） |
+| `pollTimeoutMs` | `number` | `300000` | 视频任务整体超时（毫秒），超时中止轮询 |
+| `retryTimes` | `number` | `3` | 可重试错误的最大重试次数（鉴权/配额错误不重试） |
+| `outputsDir` | `string` | `'./outputs'` | 生成媒体落地目录（相对路径基于进程 cwd） |
+| `imageTransport` | `'auto' \| 'async' \| 'sync'` | `'auto'` | 图片传输；auto 优先异步，异步端点未启用时降级同步 |
+| `imageUnknownStatePolicy` | `'fail' \| 'resubmit-same-key'` | `'fail'` | 提交超时/5xx 状态未知时的策略；默认只反查、不重提 |
+| `watermark.enabled` | `boolean` | `true` | 是否在落盘/附件前叠加品牌水印 |
+| `watermark.text` | `string` | `'Threerouter'` | 水印文字；空文本跳过后处理并保留原图 |
+| `watermark.position` | `'top-left' \| 'top-right' \| 'bottom-left' \| 'bottom-right'` | `'bottom-right'` | 水印锚点 |
+| `watermark.opacity` | `number` | `0.68` | 水印透明度，0–1 |
+| `watermark.fontSizeRatio` | `number` | `0.032` | 字号相对图片宽度比例 |
+| `watermark.marginXRatio` / `marginYRatio` | `number` | `0.028` / `0.012` | 水平/垂直边距比例 |
+| `watermark.glowEnabled` | `boolean` | `true` | 是否启用柔光描边 |
+| `watermark.glowColor` / `glowBlurRatio` | `string` / `number` | `'#ffffff'` / `0.18` | 描边颜色与模糊半径比例 |
+
+## 图片渲染设计
+
+`generate_image` 的工具结果**只向模型返回文本摘要**（本地路径、服务商、尺寸、大小），不把图片作为 `image` 内容块注入工具结果。原因：纯文本模型或网关不支持图片输入时，生成图片后的下一轮请求会直接 400。
+
+图片字节通过 attachment 服务持久化，附件引用经 `output.presentationMeta` 写入 `tool/result` 事件的 `meta` 字段——**持久化但对模型不可见**，客户端可消费它做内嵌渲染：
+
+- **模型可见**：文本摘要（`render` 产物）
+- **UI 可见**：`meta` 中的图片附件信息（`presentationMeta` 产物）
+- 图片文件始终落地 `outputs/` 目录
+- 水印后处理发生在内存中、唯一写盘入口之前；因此 UI 读取 `localPath` 时看到的就是最终水印图
+- `presentationMeta` 同时透出 `transport`、`submitAttempts`、`postprocess`、`requestId`，桌面媒体卡片会展示传输方式、物理提交次数和后处理链路
+
+## 服务依赖
+
+插件通过官方服务插槽声明依赖，不假设其他插件内部实现：
+
+| 依赖 | 声明方式 | 必需性 | 提供方 |
+|---|---|---|---|
+| `tools` | `inject = ['tools']` 顶部声明 | 插件必需，缺失则不加载 | dsh-base |
+| `attachments` | `ctx.inject(['attachments'], cb)` | `generate_image` 必需，`generate_video` 不依赖 | dsh-base 的 `attachment-local` |
+
+`generate_image` 通过 `ctx.inject` 显式声明 attachment 服务依赖：服务挂载时注册工具，服务撤销时 fiber dispose 自动注销。`generate_video` 始终注册。`cordis.patch.yml` 用 `- insert` 新增 `image-video` 行，不覆盖任何现有插件行，升级保持组合兼容。
+
+## 异常处理
+
+统一封装的 `GenerationError` 分类捕获，返回友好中文提示：
+
+| 错误种类 | 触发条件 | 是否重试 |
+|---|---|---|
+| `auth` | HTTP 401/403，API Key 无效或无权限 | 否 |
+| `quota` | HTTP 429，配额耗尽或限流 | 否 |
+| `task` | 任务逻辑错误（参数非法、服务端任务失败） | 否 |
+| `timeout` | 请求超时或任务被取消 | 取消不重试；超时重试 |
+| `network` | 网络抖动、5xx 服务端错误 | 是 |
+
+可重试错误按指数退避重试，次数由 `retryTimes` 控制。
+
+## 开发 & 测试
+
+### 前置
+
+```sh
+cd dsh-image-video
+pnpm install --ignore-workspace --no-frozen-lockfile
+```
+
+### 单元测试
+
+```sh
+pnpm run test
+```
+
+34 个测试覆盖：
+
+| 文件 | 覆盖 |
+|---|---|
+| `tests/config.test.ts` | 配置 schema 默认值校验、provider 凭证解析、非法输入拒绝 |
+| `tests/http-client.test.ts` | HTTP 状态码 → `GenerationError` 分类映射（401→auth / 429→quota / 500→network） |
+| `tests/media.test.ts` | `Content-Type` → 扩展名推断、JPEG/PNG/WEBP/MP4 映射 |
+| `tests/providers.test.ts` | 万象wanx/Seedance 适配器集成测试：mock `fetch`，覆盖 submit→query 成功路径 + 状态流转 + 异常分类 |
+
+### 类型检查 + 构建
+
+```sh
+pnpm run typecheck   # tsc --noEmit
+pnpm run build       # tsdown 输出 lib/index.js + 类型
+```
+
+### DSH 安装验证
+
+```sh
+dsh plugin --profile <profile> add /absolute/path/to/dsh-image-video
+dsh --profile <profile> --dump-config | grep -A3 "dsh-image-video"
+```
+
+预期输出出现 `# == dsh-image-video` 分层和 `image-video` 插件行。
+
+### 常见排错
+
+| 症状 | 解决 |
+|---|---|
+| `pnpm run test` 报 lockfile out of date | 重跑 `pnpm install --ignore-workspace --no-frozen-lockfile` |
+| vitest 里 fetch 真实发网请求 | 用 `vi.stubGlobal('fetch', ...)`，`afterEach` 调 `vi.unstubAllGlobals()` |
+| DSH 启动报 `cannot find module dsh-image-video` | 若用 `link:` 本地路径安装，改过 `src/` 后需跑 `pnpm run build` 让 `lib/` 与源码同步；从 git/npm 安装无需构建，产物已随包提交 |
+| 生成图片但对话无内嵌渲染 | 确认 profile 包含 `attachment-local`；图片文件始终可在 `outputs/` 查看 |
+| `size is not in the correct format` | 百炼接口要求 `*` 分隔（如 `1024*1024`），不是 `x`；插件已自动转换 |
+
+## 服务商 API 参考
+
+- **Threerouter**：[统一媒体生成 API](https://threerouter.com/)（`/v1/media/generations` 创建 → `/v1/media/{id}` 轮询 → `/v1/media/{id}/content` 下载）
+- **万象 wanx（阿里云百炼 DashScope）**：[文生图](https://help.aliyun.com/zh/model-studio/text-to-image-guide) / [文生视频](https://help.aliyun.com/zh/model-studio/video-generation)
+- **Seedance2.5（火山引擎 Ark）**：[文生图](https://docs.volcengine.com/docs/85621/1616429) / [文生视频](https://docs.volcengine.com/docs/82379/1520757)
+
+## 依赖
+
+- `@deepseek-ai/cordis`（peer）：插件框架
+- `@deepseek-ai/dsh-tools`（peer）：`defineTool` 工具注册
+- `@deepseek-ai/dsh-attachment`（peer，可选）：图片附件持久化服务
+- `@deepseek-ai/dsh-llm`（peer）：ContentBlock 类型
+- `@deepseek-ai/schemastery`：配置 Schema
+
+## 诚实声明
+
+模型输出质量由服务商模型决定，插件负责正确传参、可靠轮询和异常分类。API Key 仅在本地使用，不上传任何远程服务。本插件不附属于阿里云或火山引擎。使用各服务商 API 前请确认其服务条款。
+
+## License
+
+[MIT](LICENSE)
