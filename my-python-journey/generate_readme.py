@@ -107,6 +107,10 @@ def build_statistics(records):
         "first_date": min(dates) if dates else "-",                     # 最早日期(字符串按字典序比较,日期正好可比)
         "last_date": max(dates) if dates else "-",                      # 最近日期
         "active_days": len(set(dates)) if dates else 0,                 # 有记录的天数(set 会自动去重,所以"不同日期的个数"就是学习天数)
+        # 累计时长:把每条记录的 duration_minutes 加起来
+        # r.get("duration_minutes", 0) 的意思是"取这个字段,取不到就用 0 顶上",
+        # 所以老记录(没有这个字段)会自动按 0 计算,不会报错
+        "total_minutes": sum(r.get("duration_minutes", 0) for r in records),
     }
     return stats
 
@@ -150,6 +154,7 @@ def build_markdown(records):
         lines.append(f"| 开始学习 | {stats['first_date']} |")
         lines.append(f"| 最近记录 | {stats['last_date']} |")
         lines.append(f"| 学习天数 | **{stats['active_days']}** 天 |")
+        lines.append(f"| 累计时长 | **{stats['total_minutes']}** 分钟 |")
     lines.append("")
 
     # ---------- 3. 按日期分组的时间线 ----------
@@ -182,9 +187,14 @@ def build_markdown(records):
             for record in sorted(grouped[date], key=lambda r: r.get("time", "")):
                 time_text = record.get("time", "")
                 content = record.get("content", "(内容为空)")
+                # 取这条记录的时长;老记录没有这个字段 → .get 返回默认值 0
+                minutes = record.get("duration_minutes", 0)
+                # 只有时长大于 0 时才拼一个后缀;0 或字段缺失就拼空字符串,
+                # 这样老记录的显示效果和加字段之前完全一样(向后兼容)
+                suffix = f" · ⏱ {minutes} 分钟" if minutes else ""
                 # `时间` 用行内代码样式显示,内容加粗更醒目
                 prefix = f"`{time_text}` " if time_text else ""
-                lines.append(f"- {prefix}**{content}**")
+                lines.append(f"- {prefix}**{content}**{suffix}")
 
             lines.append("")
 

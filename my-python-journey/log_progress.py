@@ -164,6 +164,39 @@ def ask_content():
         return content
 
 
+def ask_duration():
+    """
+    询问本次学习时长(分钟)。
+
+    返回值: 一个整数(分钟)。用户直接回车 = 0 分钟。
+    """
+    print()
+    print("=" * 52)
+    print("⏱  这次学了多久?(填分钟数,例如 45)")
+    print("   (直接回车 = 按 0 分钟记录,不影响本条学习内容)")
+    print("=" * 52)
+
+    while True:
+        # input() 拿到的永远是"字符串":用户敲 45,得到的是 "45" 而不是数字 45
+        raw = input("👉 ").strip()
+
+        if raw == "":
+            return 0            # 用户不想填 → 记 0 分钟
+
+        try:
+            minutes = int(raw)  # 把 "45" 这样的文字转成真正的数字 45
+        except ValueError:
+            # 用户输入的不是数字(例如"半小时""四十五"),int() 会抛 ValueError
+            print("   ⚠️  请输入阿拉伯数字,例如 45")
+            continue            # continue = 跳回 while 开头,重新问一次
+
+        if minutes < 0:
+            print("   ⚠️  时长不能为负数")
+            continue
+
+        return minutes          # 校验通过,把结果交回给调用者
+
+
 def main():
     """
     主流程:读旧数据 → 询问内容 → 追加记录 → 写回文件 → 汇报结果。
@@ -181,22 +214,27 @@ def main():
         print("\n👋 本次没有记录任何内容,程序结束。")
         return            # return 表示"提前结束函数",后面的代码不执行了
 
-    # 第 3 步:组装一条新记录
+    # 第 3 步:再问一下这次学了多久(AskQuestion → 把"问时长"单独拎出来,顺序更清楚)
+    minutes = ask_duration()
+
+    # 第 4 步:组装一条新记录
     now = datetime.now()  # 拿到当前日期和时间
     new_record = {
         "date": now.strftime("%Y-%m-%d"),   # 日期,例如 2026-10-15
         "time": now.strftime("%H:%M:%S"),   # 时间,例如 21:30:05
         "content": content,                 # 学习内容
+        "duration_minutes": minutes,        # 学习时长(整数分钟)——本次新增的字段
     }
 
-    # 第 4 步:追加到列表末尾,并写回文件
+    # 第 5 步:追加到列表末尾,并写回文件
     records.append(new_record)              # list.append():在列表末尾加入一个元素 = "追加"
     save_records(DATA_FILE, records)
 
-    # 第 5 步:给用户一个明确的反馈(程序最好"有问有答",体验才好)
+    # 第 6 步:给用户一个明确的反馈(程序最好"有问有答",体验才好)
     print()
     print("✅ 记录成功!")
     print(f"   内容:{content}")
+    print(f"   时长:{new_record['duration_minutes']} 分钟")
     print(f"   时间:{new_record['date']} {new_record['time']}")
     print(f"   累计:{len(records)} 条")
     print(f"   文件:{DATA_FILE}")
