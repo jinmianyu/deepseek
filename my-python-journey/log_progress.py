@@ -122,14 +122,23 @@ def save_records(file_path, records):
 
     注意:这里是"整体重写"文件,但写进去的内容 = 旧记录 + 新记录,
     所以从结果上看,相当于"追加"了一条。
+
+    小知识:newline="\n" 是做什么的?
+    Windows 下 Python 默认会把换行符 \n 自动转换成 \r\n(回车+换行),
+    这会让文件在不同系统上出现"看不见的差异"(例如 git 显示文件被修改)。
+    这里强制写成 \n,可以让 macOS / Linux / Windows 上的结果保持一致,
+    推送到 GitHub 后也不会产生多余的空行或改动。
     """
-    with file_path.open("w", encoding="utf-8") as f:
+    with file_path.open("w", encoding="utf-8", newline="\n") as f:
         json.dump(
             records,              # 要写入的数据(Python 列表)
             f,                    # 写到哪个文件
             ensure_ascii=False,   # 关键!False 表示中文直接原样写入,而不是变成 \u5b57 这样的转义码
             indent=2,             # 每层缩进 2 个空格,让文件整齐、方便人直接阅读
         )
+        # json.dump 不会自动加末尾换行,这里手动补一个。
+        # 文本文件以换行符结尾是通行规范,能让 git 的差异对比更干净。
+        f.write("\n")
 
 
 def ask_content():
